@@ -104,6 +104,14 @@ async function ensureMacMicrophoneAccess(context: string): Promise<boolean> {
  */
 function getMacScreenCaptureStatus(): 'granted' | 'denied' | 'not-determined' | 'restricted' {
   if (process.platform !== 'darwin') return 'granted';
+  
+  // In development mode, macOS TCC often falsely reports 'denied' for the electron binary 
+  // even if the user has granted permission to their Terminal app.
+  if (!app.isPackaged) {
+    console.log('[Main] Ignoring screen capture permission check in development mode');
+    return 'granted';
+  }
+
   try {
     return systemPreferences.getMediaAccessStatus('screen') as
       'granted' | 'denied' | 'not-determined' | 'restricted';
@@ -302,25 +310,21 @@ export class AppState {
           // Adapted from public PR #113 — verify premium interaction
           this.toggleOverlayMousePassthrough();
         } else if (actionId === 'general:take-screenshot') {
-          const screenshotPath = await this.takeScreenshot(false);
-          const preview = await this.getImagePreview(screenshotPath);
+          // Route to renderer via global-shortcut so the renderer handles the
+          // screenshot through the IPC invoke path (request/response guarantee).
+          // The old pattern — main takes screenshot → fires screenshot-taken event →
+          // renderer listener catches it — was unreliable in overlay mode because the
+          // fire-and-forget event could be missed if the listener registration had any
+          // timing gap. The invoke path used by generalHandlers.takeScreenshot() is
+          // already proven to work for UI-button screenshots; reuse it here.
           const mainWindow = this.getMainWindow();
-          if (mainWindow) {
-            mainWindow.webContents.send("screenshot-taken", {
-              path: screenshotPath,
-              preview
-            });
+          if (mainWindow && !mainWindow.isDestroyed()) {
+            mainWindow.webContents.send('global-shortcut', { action: 'takeScreenshot' });
           }
         } else if (actionId === 'general:selective-screenshot') {
-          const screenshotPath = await this.takeSelectiveScreenshot(false);
-          const preview = await this.getImagePreview(screenshotPath);
           const mainWindow = this.getMainWindow();
-          if (mainWindow) {
-            // preload.ts maps 'screenshot-attached' to onScreenshotAttached
-            mainWindow.webContents.send("screenshot-attached", {
-              path: screenshotPath,
-              preview
-            });
+          if (mainWindow && !mainWindow.isDestroyed()) {
+            mainWindow.webContents.send('global-shortcut', { action: 'selectiveScreenshot' });
           }
         } else if (actionId === 'general:capture-and-process') {
           // Single-trigger: capture current screen then immediately request AI analysis
@@ -798,10 +802,17 @@ export class AppState {
   private googleSTT: STTProvider | null = null; // Interviewer
   private googleSTT_User: STTProvider | null = null; // User
 
-  private createSTTProvider(speaker: 'interviewer' | 'user'): STTProvider {
+  private createSTTProvider(speaker: 'interviewer' | 'user'): STTProvider | null {
     const { CredentialsManager } = require('./services/CredentialsManager');
     const sttProvider = CredentialsManager.getInstance().getSttProvider();
     const sttLanguage = CredentialsManager.getInstance().getSttLanguage();
+
+    // 'none' means the user has explicitly disabled STT (no provider selected).
+    // Return null so the pipeline skips STT without falling back to Google.
+    if (sttProvider === 'none') {
+      console.log(`[Main] STT provider is 'none' — audio capture will proceed but transcription is disabled.`);
+      return null;
+    }
 
     let stt: STTProvider;
 
@@ -967,9 +978,10 @@ export class AppState {
         this.systemAudioCapture.on('speech_ended', () => {
           this.googleSTT?.notifySpeechEnded?.();
         });
-        this.systemAudioCapture.on('error', (err: Error) => {
-          console.error('[Main] SystemAudioCapture Error:', err);
-        });
+        // PR #173: Wire audio recovery handler — handles both logging and auto-restart.
+        // NOTE: Do NOT add a separate 'error' listener here; setupAudioRecoveryHandler
+        // registers its own which logs + recovers. Dual listeners would double-fire.
+        this.setupAudioRecoveryHandler();
       }
 
       if (!this.microphoneCapture) {
@@ -1061,9 +1073,9 @@ export class AppState {
       this.systemAudioCapture.on('speech_ended', () => {
         this.googleSTT?.notifySpeechEnded?.();
       });
-      this.systemAudioCapture.on('error', (err: Error) => {
-        console.error('[Main] SystemAudioCapture Error:', err);
-      });
+      // PR #173: Re-wire recovery handler on the new capture instance after device reconfigure.
+      // Without this, audio recovery is lost whenever the user changes their output device.
+      this.setupAudioRecoveryHandler();
       console.log('[Main] SystemAudioCapture initialized.');
     } catch (err) {
       console.warn('[Main] Failed to initialize SystemAudioCapture with preferred ID. Falling back to default.', err);
@@ -1088,9 +1100,8 @@ export class AppState {
         this.systemAudioCapture.on('speech_ended', () => {
           this.googleSTT?.notifySpeechEnded?.();
         });
-        this.systemAudioCapture.on('error', (err: Error) => {
-          console.error('[Main] SystemAudioCapture (Default) Error:', err);
-        });
+        // PR #173: Recovery handler on fallback path too
+        this.setupAudioRecoveryHandler();
       } catch (err2) {
         console.error('[Main] Failed to initialize SystemAudioCapture (Default):', err2);
       }
@@ -1179,11 +1190,12 @@ export class AppState {
       this.googleSTT_User = null;
     }
 
-    // Reinitialize the pipeline (will pick up the new provider from CredentialsManager)
-    this.setupSystemAudioPipeline();
-
-    // Restart audio captures and new STT instances if a meeting is active
+    // Only reinitialize the pipeline when a meeting is already active.
+    // Outside a meeting, defer pipeline creation to startMeeting() so we never
+    // eagerly construct a MicrophoneCapture (which calls build_input_stream on
+    // macOS and immediately triggers the orange mic indicator even without .play()).
     if (this.isMeetingActive) {
+      this.setupSystemAudioPipeline();
       this.systemAudioCapture?.start();
       this.microphoneCapture?.start();
       this.googleSTT?.start();
@@ -1191,6 +1203,74 @@ export class AppState {
     }
 
     console.log('[Main] STT Provider reconfigured');
+
+    // Broadcast the new STT config state to all windows so they can update banners / warnings
+    const { CredentialsManager: CM } = require('./services/CredentialsManager');
+    const newProvider = CM.getInstance().getSttProvider();
+    this.broadcast('stt-config-changed', { configured: newProvider !== 'none', provider: newProvider });
+  }
+
+  /**
+   * PR #173: Audio Recovery Handler
+   *
+   * Listens for 'audio-capture-failed' emit from SystemAudioCapture and
+   * transparently restarts the full capture + STT pipeline without ending the
+   * meeting session. Prevents silent audio loss when macOS CoreAudio or SCK
+   * drops the capture stream mid-session (e.g. device re-plug, Display Sleep).
+   */
+  private _systemAudioRecoveryInProgress = false;
+  private _systemAudioRecoveryAttempts = 0;
+  private _systemAudioRecoveryTimer: NodeJS.Timeout | null = null;
+  private _systemAudioLastFailureAt: number | null = null;
+  private _systemAudioSuccessfulRestarts = 0;
+  private _systemAudioConsecutiveFailures = 0;
+
+  private setupAudioRecoveryHandler(): void {
+    if (!this.systemAudioCapture) return;
+
+    this.systemAudioCapture.on('error', async (err: Error) => {
+      if (!this.isMeetingActive) return; // Only attempt recovery during active meetings
+
+      const now = Date.now();
+      this._systemAudioLastFailureAt = now;
+      this._systemAudioConsecutiveFailures++;
+
+      // Cap at 3 consecutive recovery attempts to avoid infinite restart loops
+      if (this._systemAudioRecoveryInProgress || this._systemAudioRecoveryAttempts >= 3) {
+        console.warn(
+          `[AudioRecovery] Skipping recovery — already in progress or max attempts (${this._systemAudioRecoveryAttempts}/3) reached.`,
+        );
+        return;
+      }
+
+      this._systemAudioRecoveryInProgress = true;
+      this._systemAudioRecoveryAttempts++;
+      console.warn(
+        `[AudioRecovery] SystemAudioCapture error — attempting recovery #${this._systemAudioRecoveryAttempts}: ${err.message}`,
+      );
+
+      try {
+        // Brief delay so the OS can release the device before re-acquisition
+        await new Promise<void>(resolve => {
+          this._systemAudioRecoveryTimer = setTimeout(resolve, 1500);
+        });
+        this._systemAudioRecoveryTimer = null;
+
+        // Restart the audio captures without disturbing the STT provider or the session
+        this.systemAudioCapture?.stop();
+        this.systemAudioCapture?.start();
+
+        this._systemAudioSuccessfulRestarts++;
+        this._systemAudioConsecutiveFailures = 0;
+        console.log(
+          `[AudioRecovery] SystemAudioCapture restarted successfully (total restarts: ${this._systemAudioSuccessfulRestarts}).`,
+        );
+      } catch (recoveryErr: any) {
+        console.error(`[AudioRecovery] Recovery attempt #${this._systemAudioRecoveryAttempts} failed:`, recoveryErr);
+      } finally {
+        this._systemAudioRecoveryInProgress = false;
+      }
+    });
   }
 
 
@@ -1288,6 +1368,15 @@ export class AppState {
   public async startMeeting(metadata?: any): Promise<void> {
     console.log('[Main] Starting Meeting...', metadata);
 
+    // PR #173: Reset audio recovery state for fresh session
+    this._systemAudioRecoveryInProgress = false;
+    this._systemAudioRecoveryAttempts = 0;
+    this._systemAudioConsecutiveFailures = 0;
+    if (this._systemAudioRecoveryTimer) {
+      clearTimeout(this._systemAudioRecoveryTimer);
+      this._systemAudioRecoveryTimer = null;
+    }
+
     if (!(await ensureMacMicrophoneAccess('meeting start'))) {
       const message = 'Microphone access denied. Please allow microphone access in System Settings.';
       this.broadcast('meeting-audio-error', message);
@@ -1304,12 +1393,15 @@ export class AppState {
       const screenStatus = getMacScreenCaptureStatus();
       console.log(`[Main] macOS screen recording permission status: ${screenStatus}`);
       if (screenStatus === 'denied') {
-        // Permission was explicitly denied — open System Settings and warn the user.
-        // We don't throw here: meeting continues with microphone-only transcription.
+        // Permission was explicitly denied — warn the user via the UI but do NOT
+        // auto-open System Settings. Forcing that window open every meeting start
+        // is extremely disruptive, especially when mic transcription is still working.
+        // The UI will show a non-blocking banner; the user can fix it deliberately.
         const message = 'Screen Recording permission denied. System audio will not be captured. To fix: System Settings → Privacy & Security → Screen Recording → enable Natively.';
         console.warn('[Main]', message);
         this.broadcast('system-audio-permission-denied', message);
-        shell.openExternal('x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture');
+        // NOTE: Do NOT call shell.openExternal() here — it hijacks focus on every meeting
+        // start. The UI banner (system-audio-permission-denied IPC event) handles this.
       }
       // 'not-determined': Handled at startup. SCK/CoreAudio will trigger the TCC
       // dialog itself when it first attempts to access screen content.
@@ -2234,6 +2326,8 @@ export class AppState {
     setVerboseLoggingFlag(enabled);
     SettingsManager.getInstance().set('verboseLogging', enabled);
     console.log(`[AppState] verboseLogging set to ${enabled}`);
+    // Notify all renderer windows so they can start/stop forwarding their console output
+    this.broadcast('verbose-logging-changed', enabled);
   }
 
   public setDisguise(mode: 'terminal' | 'settings' | 'activity' | 'none'): void {
@@ -2525,29 +2619,50 @@ async function initializeApp() {
     setTimeout(async () => {
       try {
         const screenStatus = systemPreferences.getMediaAccessStatus('screen');
+        console.log(`[Init] Screen recording permission status at startup: ${screenStatus}`);
+
+        if (!app.isPackaged) {
+          console.log('[Init] Ignoring screen recording permission check in development mode');
+          return;
+        }
+
         if (screenStatus === 'not-determined') {
-          console.log('[Init] Screen recording permission not-determined — triggering one-time TCC dialog after window is ready...');
-          // Minimal thumbnail: we only want the TCC side-effect, not actual image data.
-          await desktopCapturer.getSources({ types: ['screen'], thumbnailSize: { width: 1, height: 1 } });
-          const afterStatus = systemPreferences.getMediaAccessStatus('screen');
-          console.log(`[Init] Screen recording status after startup TCC prompt: ${afterStatus}`);
-          if (afterStatus === 'denied') {
-            // Notify all open windows so the renderer can show a non-blocking banner.
-            const { BrowserWindow } = require('electron');
-            BrowserWindow.getAllWindows().forEach((win: Electron.BrowserWindow) => {
-              if (!win.isDestroyed()) {
-                win.webContents.send('system-audio-permission-denied',
-                  'Screen Recording was denied. Enable it in System Settings > Privacy & Security > Screen Recording, then restart Natively.');
-              }
-            });
+          // First launch: trigger the one-time TCC dialog by making a minimal
+          // desktopCapturer call. macOS will show the permission sheet anchored
+          // to our window. The user's response is stored permanently in the TCC
+          // database — we do NOT check status immediately after because the dialog
+          // is still open; the status will be read correctly next time `startMeeting`
+          // is called (which is the correct gate for system audio access).
+          console.log('[Init] Screen recording not-determined — showing one-time TCC dialog...');
+          try {
+            await desktopCapturer.getSources({ types: ['screen'], thumbnailSize: { width: 1, height: 1 } });
+          } catch (e) {
+            // On some Electron builds getSources throws when permission is pending —
+            // that's fine; the TCC dialog has still been triggered.
+            console.log('[Init] getSources threw (expected during TCC pending state):', (e as Error).message);
           }
+          // NOTE: Do NOT read afterStatus here — TCC response is async (dialog still open).
+          // startMeeting() reads the status when the user actually tries to use audio.
+
+        } else if (screenStatus === 'denied') {
+          // Returning user who previously denied — show the banner immediately at startup
+          // so they know system audio won't work before they even start a meeting.
+          console.warn('[Init] Screen recording was previously denied — notifying UI banner.');
+          const { BrowserWindow } = require('electron');
+          BrowserWindow.getAllWindows().forEach((win: Electron.BrowserWindow) => {
+            if (!win.isDestroyed()) {
+              win.webContents.send(
+                'system-audio-permission-denied',
+                'Screen Recording is disabled. System audio capture will not work. Click "Open Settings" to enable it, then restart Natively.'
+              );
+            }
+          });
         } else {
-          console.log(`[Init] Screen recording permission already resolved at startup: ${screenStatus}`);
+          // 'granted' or 'restricted' — nothing to do.
+          console.log(`[Init] Screen recording permission already resolved: ${screenStatus}`);
         }
       } catch (e) {
-        // Log the real OS error so it appears in natively_debug.log for support diagnosis.
-        // We do NOT re-throw — a missing screen-capture permission is non-fatal at launch.
-        console.warn('[Init] Startup screen recording permission check failed. Screenshots and system audio may not work. Error:', e);
+        console.warn('[Init] Startup screen recording permission check failed:', e);
       }
     }, 800);
   }

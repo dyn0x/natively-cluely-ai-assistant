@@ -62,9 +62,16 @@ interface ElectronAPI {
   setNativelyApiKey: (apiKey: string) => Promise<{ success: boolean; error?: string }>
   getNativelyUsage: () => Promise<{ ok: boolean; plan?: string; quota?: { transcription: { used: number; limit: number; remaining: number }; ai: { used: number; limit: number; remaining: number }; search: { used: number; limit: number; remaining: number }; resets_at: string }; member_since?: string; error?: string; status?: number }>
   getStoredCredentials: () => Promise<{ hasGeminiKey: boolean; hasGroqKey: boolean; hasOpenaiKey: boolean; hasClaudeKey: boolean; hasNativelyKey: boolean; googleServiceAccountPath: string | null; sttProvider: string; hasSttGroqKey: boolean; hasSttOpenaiKey: boolean; hasDeepgramKey: boolean; hasElevenLabsKey: boolean; hasAzureKey: boolean; azureRegion: string; hasIbmWatsonKey: boolean; ibmWatsonRegion: string; hasSonioxKey: boolean }>
+  // Free Trial
+  startTrial:     () => Promise<{ ok: boolean; trial_token?: string; started_at?: string; expires_at?: string; expired?: boolean; already_used?: boolean; converted_to?: string | null; usage?: { ai: number; stt_seconds: number; search: number }; limits?: { duration_ms: number; ai_requests: number; stt_minutes: number; search_requests: number }; error?: string; status?: number }>
+  getTrialStatus: () => Promise<{ ok: boolean; expired?: boolean; remaining_ms?: number; started_at?: string; expires_at?: string; converted_to?: string | null; usage?: { ai: number; stt_seconds: number; search: number }; limits?: object; error?: string }>
+  getLocalTrial:  () => Promise<{ hasToken: boolean; trialToken?: string; expiresAt?: string; startedAt?: string; expired?: boolean }>
+  convertTrial:   (choice: string) => Promise<{ ok: boolean }>
+  endTrialByok:   () => Promise<{ success: boolean; error?: string }>
+  onTrialEnded:   (cb: (data: { choice: string }) => void) => () => void
 
   // STT Provider Management
-  setSttProvider: (provider: 'google' | 'groq' | 'openai' | 'deepgram' | 'elevenlabs' | 'azure' | 'ibmwatson' | 'soniox' | 'natively') => Promise<{ success: boolean; error?: string }>
+  setSttProvider: (provider: 'none' | 'google' | 'groq' | 'openai' | 'deepgram' | 'elevenlabs' | 'azure' | 'ibmwatson' | 'soniox' | 'natively') => Promise<{ success: boolean; error?: string }>
   getSttProvider: () => Promise<string>
   setGroqSttApiKey: (apiKey: string) => Promise<{ success: boolean; error?: string }>
   setOpenAiSttApiKey: (apiKey: string) => Promise<{ success: boolean; error?: string }>
@@ -75,7 +82,12 @@ interface ElectronAPI {
   setIbmWatsonApiKey: (apiKey: string) => Promise<{ success: boolean; error?: string }>
   setGroqSttModel: (model: string) => Promise<{ success: boolean; error?: string }>
   setSonioxApiKey: (apiKey: string) => Promise<{ success: boolean; error?: string }>
+  setIbmWatsonRegion: (region: string) => Promise<{ success: boolean; error?: string }>
   testSttConnection: (provider: 'groq' | 'openai' | 'deepgram' | 'elevenlabs' | 'azure' | 'ibmwatson' | 'soniox', apiKey: string, region?: string) => Promise<{ success: boolean; error?: string }>
+
+  // STT Config Events
+  onSttConfigChanged: (callback: (data: { configured: boolean; provider: string }) => void) => () => void
+  onCredentialsChanged: (callback: () => void) => () => void
 
   // Native Audio Service Events
   onNativeAudioTranscript: (callback: (transcript: { speaker: string; text: string; final: boolean }) => void) => () => void
@@ -94,6 +106,7 @@ interface ElectronAPI {
   getSttLanguage: () => Promise<string>
   getAiResponseLanguage: () => Promise<string>
   onSttLanguageAutoDetected: (callback: (bcp47: string) => void) => () => void
+  onSystemAudioPermissionDenied: (callback: (message: string) => void) => () => void
 
   // Intelligence Mode IPC
   generateAssist: () => Promise<{ insight: string | null }>
@@ -267,6 +280,8 @@ interface ElectronAPI {
   // Verbose / Debug Logging
   getVerboseLogging: () => Promise<boolean>;
   setVerboseLogging: (enabled: boolean) => Promise<{ success: boolean }>;
+  getLogFilePath: () => Promise<string | null>;
+  openLogFile: () => Promise<{ success: boolean; error?: string }>;
   
   // Arch
   getArch: () => Promise<string>;
@@ -511,8 +526,25 @@ contextBridge.exposeInMainWorld("electronAPI", {
   getNativelyUsage: () => ipcRenderer.invoke("get-natively-usage"),
   getStoredCredentials: () => ipcRenderer.invoke("get-stored-credentials"),
 
+  // Permissions
+  checkPermissions:    () => ipcRenderer.invoke("permissions:check"),
+  requestMicPermission: () => ipcRenderer.invoke("permissions:request-mic"),
+
+  // Free Trial
+  startTrial:       () => ipcRenderer.invoke("trial:start"),
+  getTrialStatus:   () => ipcRenderer.invoke("trial:status"),
+  getLocalTrial:    () => ipcRenderer.invoke("trial:get-local"),
+  convertTrial:     (choice: string) => ipcRenderer.invoke("trial:convert", choice),
+  endTrialByok:        () => ipcRenderer.invoke("trial:end-byok"),
+  wipeTrialProfileData: () => ipcRenderer.invoke("trial:wipe-profile-data"),
+  onTrialEnded:     (cb: (data: { choice: string }) => void) => {
+    const sub = (_: any, data: any) => cb(data);
+    ipcRenderer.on('trial-ended', sub);
+    return () => ipcRenderer.removeListener('trial-ended', sub);
+  },
+
   // STT Provider Management
-  setSttProvider: (provider: 'google' | 'groq' | 'openai' | 'deepgram' | 'elevenlabs' | 'azure' | 'ibmwatson' | 'soniox' | 'natively') => ipcRenderer.invoke("set-stt-provider", provider),
+  setSttProvider: (provider: 'none' | 'google' | 'groq' | 'openai' | 'deepgram' | 'elevenlabs' | 'azure' | 'ibmwatson' | 'soniox' | 'natively') => ipcRenderer.invoke("set-stt-provider", provider),
   getSttProvider: () => ipcRenderer.invoke("get-stt-provider"),
   setGroqSttApiKey: (apiKey: string) => ipcRenderer.invoke("set-groq-stt-api-key", apiKey),
   setOpenAiSttApiKey: (apiKey: string) => ipcRenderer.invoke("set-openai-stt-api-key", apiKey),
@@ -523,7 +555,20 @@ contextBridge.exposeInMainWorld("electronAPI", {
   setIbmWatsonApiKey: (apiKey: string) => ipcRenderer.invoke("set-ibmwatson-api-key", apiKey),
   setGroqSttModel: (model: string) => ipcRenderer.invoke("set-groq-stt-model", model),
   setSonioxApiKey: (apiKey: string) => ipcRenderer.invoke("set-soniox-api-key", apiKey),
+  setIbmWatsonRegion: (region: string) => ipcRenderer.invoke("set-ibmwatson-region", region),
   testSttConnection: (provider: 'groq' | 'openai' | 'deepgram' | 'elevenlabs' | 'azure' | 'ibmwatson' | 'soniox', apiKey: string, region?: string) => ipcRenderer.invoke("test-stt-connection", provider, apiKey, region),
+
+  // STT Config Events (Adapted from public PR #173 — verify premium interaction)
+  onSttConfigChanged: (callback: (data: { configured: boolean; provider: string }) => void) => {
+    const subscription = (_: any, data: any) => callback(data);
+    ipcRenderer.on('stt-config-changed', subscription);
+    return () => { ipcRenderer.removeListener('stt-config-changed', subscription); };
+  },
+  onCredentialsChanged: (callback: () => void) => {
+    const subscription = () => callback();
+    ipcRenderer.on('credentials-changed', subscription);
+    return () => { ipcRenderer.removeListener('credentials-changed', subscription); };
+  },
 
   // Native Audio Service Events
   onNativeAudioTranscript: (callback: (transcript: { speaker: string; text: string; final: boolean }) => void) => {
@@ -590,6 +635,11 @@ contextBridge.exposeInMainWorld("electronAPI", {
     const subscription = (_: any, bcp47: string) => callback(bcp47);
     ipcRenderer.on('stt-language-auto-detected', subscription);
     return () => { ipcRenderer.removeListener('stt-language-auto-detected', subscription); };
+  },
+  onSystemAudioPermissionDenied: (callback: (message: string) => void) => {
+    const subscription = (_: any, message: string) => callback(message);
+    ipcRenderer.on('system-audio-permission-denied', subscription);
+    return () => { ipcRenderer.removeListener('system-audio-permission-denied', subscription); };
   },
 
   // Intelligence Mode IPC
@@ -1034,9 +1084,17 @@ contextBridge.exposeInMainWorld("electronAPI", {
   // License Management
   licenseActivate: (key: string) => ipcRenderer.invoke('license:activate', key),
   licenseCheckPremium: () => ipcRenderer.invoke('license:check-premium'),
+  licenseGetDetails: () => ipcRenderer.invoke('license:get-details'),
   licenseCheckPremiumAsync: () => ipcRenderer.invoke('license:check-premium-async'),
   licenseDeactivate: () => ipcRenderer.invoke('license:deactivate'),
   licenseGetHardwareId: () => ipcRenderer.invoke('license:get-hardware-id'),
+  onLicenseStatusChanged: (callback: (data: { isPremium: boolean, plan?: string }) => void) => {
+    const subscription = (_: any, data: { isPremium: boolean, plan?: string }) => callback(data);
+    ipcRenderer.on('license-status-changed', subscription);
+    return () => {
+      ipcRenderer.removeListener('license-status-changed', subscription);
+    };
+  },
 
   // Overlay Opacity (Stealth Mode)
   setOverlayOpacity: (opacity: number) => ipcRenderer.invoke('set-overlay-opacity', opacity),
@@ -1051,6 +1109,8 @@ contextBridge.exposeInMainWorld("electronAPI", {
   // Verbose / Debug Logging
   getVerboseLogging: () => ipcRenderer.invoke('get-verbose-logging'),
   setVerboseLogging: (enabled: boolean) => ipcRenderer.invoke('set-verbose-logging', enabled),
+  getLogFilePath: () => ipcRenderer.invoke('get-log-file-path'),
+  openLogFile: () => ipcRenderer.invoke('open-log-file'),
   
   // Arch
   getArch: () => ipcRenderer.invoke('get-arch'),
@@ -1069,3 +1129,43 @@ contextBridge.exposeInMainWorld("electronAPI", {
   // Platform
   platform: process.platform,
 } as ElectronAPI)
+
+// Renderer-side console forwarding to main-process log file.
+// When verbose logging is on, patch console.log/warn/error so that renderer
+// output appears in ~/Documents/natively_debug.log alongside main-process logs.
+;(function patchRendererConsole() {
+  let _verbose = false;
+
+  const _origLog = console.log.bind(console);
+  const _origWarn = console.warn.bind(console);
+  const _origError = console.error.bind(console);
+
+  function serialize(...args: any[]): string {
+    return args.map(a => {
+      if (a instanceof Error) return a.stack || a.message;
+      if (typeof a === 'object') { try { return JSON.stringify(a); } catch { return String(a); } }
+      return String(a);
+    }).join(' ');
+  }
+
+  console.log = (...args: any[]) => {
+    _origLog(...args);
+    if (_verbose) ipcRenderer.send('forward-log-to-file', 'log', serialize(...args));
+  };
+  console.warn = (...args: any[]) => {
+    _origWarn(...args);
+    if (_verbose) ipcRenderer.send('forward-log-to-file', 'warn', serialize(...args));
+  };
+  console.error = (...args: any[]) => {
+    _origError(...args);
+    if (_verbose) ipcRenderer.send('forward-log-to-file', 'error', serialize(...args));
+  };
+
+  // Sync verbose flag from main process at startup
+  ipcRenderer.invoke('get-verbose-logging').then((v: boolean) => { _verbose = v; }).catch(() => {});
+
+  // Keep flag in sync when the user toggles verbose in settings
+  ipcRenderer.on('verbose-logging-changed', (_event: any, enabled: boolean) => {
+    _verbose = enabled;
+  });
+})()

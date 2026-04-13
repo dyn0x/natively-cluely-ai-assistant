@@ -363,9 +363,10 @@ interface SettingsOverlayProps {
     isOpen: boolean;
     onClose: () => void;
     initialTab?: string;
+    isTrialActive?: boolean;
 }
 
-const SettingsOverlay: React.FC<SettingsOverlayProps> = ({ isOpen, onClose, initialTab = 'general' }) => {
+const SettingsOverlay: React.FC<SettingsOverlayProps> = ({ isOpen, onClose, initialTab = 'general', isTrialActive = false }) => {
     const isLight = useResolvedTheme() === 'light';
     const [activeTab, setActiveTab] = useState(initialTab);
     
@@ -410,6 +411,9 @@ const SettingsOverlay: React.FC<SettingsOverlayProps> = ({ isOpen, onClose, init
     const [profileData, setProfileData] = useState<any>(null);
     const [isPremiumModalOpen, setIsPremiumModalOpen] = useState(false);
     const [isPremium, setIsPremium] = useState(false);
+    const [premiumPlan, setPremiumPlan] = useState<string>('');
+    // Trial users get the same profile access as premium users for the duration of the trial
+    const hasProfileAccess = isPremium || isTrialActive;
     const [jdUploading, setJdUploading] = useState(false);
     const [jdError, setJdError] = useState('');
     const [companyResearching, setCompanyResearching] = useState(false);
@@ -423,12 +427,21 @@ const SettingsOverlay: React.FC<SettingsOverlayProps> = ({ isOpen, onClose, init
     const [negotiationGenerating, setNegotiationGenerating] = useState(false);
     const [negotiationError, setNegotiationError] = useState('');
     const [verboseLogging, setVerboseLogging] = useState(false);
+    const [showVerboseToast, setShowVerboseToast] = useState(false);
+    const verboseToastTimerRef = React.useRef<ReturnType<typeof setTimeout> | null>(null);
 
     // Close dropdown when clicking outside
     // Sync with global state changes
     useEffect(() => {
         if (isOpen) {
-            window.electronAPI?.licenseCheckPremium?.().then(setIsPremium).catch(() => { });
+            if (window.electronAPI?.licenseGetDetails) {
+                window.electronAPI.licenseGetDetails().then((details) => {
+                    setIsPremium(details.isPremium);
+                    if (details.plan) setPremiumPlan(details.plan);
+                }).catch(() => { });
+            } else {
+                window.electronAPI?.licenseCheckPremium?.().then(setIsPremium).catch(() => { });
+            }
             
             // Fetch true initial state from main process
             window.electronAPI?.getUndetectable?.().then(setIsUndetectable).catch(() => { });
@@ -437,6 +450,34 @@ const SettingsOverlay: React.FC<SettingsOverlayProps> = ({ isOpen, onClose, init
             window.electronAPI?.getVerboseLogging?.().then(setVerboseLogging).catch(() => { });
         }
     }, [isOpen]);
+
+    useEffect(() => {
+        if (!showVerboseToast) return;
+        verboseToastTimerRef.current = setTimeout(() => setShowVerboseToast(false), 5200);
+        return () => {
+            if (verboseToastTimerRef.current) clearTimeout(verboseToastTimerRef.current);
+        };
+    }, [showVerboseToast]);
+
+    useEffect(() => {
+        if (window.electronAPI?.onLicenseStatusChanged) {
+            return window.electronAPI.onLicenseStatusChanged((data) => {
+                if (data.isPremium) {
+                    if (window.electronAPI.licenseGetDetails) {
+                        window.electronAPI.licenseGetDetails().then((details) => {
+                            setIsPremium(details.isPremium);
+                            if (details.plan) setPremiumPlan(details.plan);
+                        }).catch(() => { });
+                    } else {
+                        setIsPremium(true);
+                    }
+                } else {
+                    setIsPremium(false);
+                    setPremiumPlan('');
+                }
+            });
+        }
+    }, []);
 
     useEffect(() => {
         if (window.electronAPI?.onUndetectableChanged) {
@@ -805,7 +846,7 @@ const SettingsOverlay: React.FC<SettingsOverlayProps> = ({ isOpen, onClose, init
     const [useExperimentalSck, setUseExperimentalSck] = useState(false);
 
     // STT Provider settings
-    const [sttProvider, setSttProvider] = useState<'google' | 'groq' | 'openai' | 'deepgram' | 'elevenlabs' | 'azure' | 'ibmwatson' | 'soniox' | 'natively'>('google');
+    const [sttProvider, setSttProvider] = useState<'none' | 'google' | 'groq' | 'openai' | 'deepgram' | 'elevenlabs' | 'azure' | 'ibmwatson' | 'soniox' | 'natively'>('none');
     const [groqSttModel, setGroqSttModel] = useState('whisper-large-v3-turbo');
     const [sttGroqKey, setSttGroqKey] = useState('');
     const [sttOpenaiKey, setSttOpenaiKey] = useState('');
@@ -851,7 +892,7 @@ const SettingsOverlay: React.FC<SettingsOverlayProps> = ({ isOpen, onClose, init
                 // @ts-ignore
                 const creds = await window.electronAPI?.getStoredCredentials?.();
                 if (creds) {
-                    setSttProvider(creds.sttProvider || 'google');
+                    setSttProvider(creds.sttProvider || 'none');
                     if (creds.groqSttModel) setGroqSttModel(creds.groqSttModel);
                     setGoogleServiceAccountPath(creds.googleServiceAccountPath);
                     setHasStoredSttGroqKey(creds.hasSttGroqKey);
@@ -880,7 +921,33 @@ const SettingsOverlay: React.FC<SettingsOverlayProps> = ({ isOpen, onClose, init
         if (isOpen) loadSttSettings();
     }, [isOpen]);
 
-    const handleSttProviderChange = async (provider: 'google' | 'groq' | 'openai' | 'deepgram' | 'elevenlabs' | 'azure' | 'ibmwatson' | 'soniox' | 'natively') => {
+    // PR #173: Live-reload settings whenever the backend broadcasts a credentials change
+    // (e.g., when the user saves an STT key in a different window, or main fires it after
+    // a provider auto-reconfigure like Natively key clear).
+    useEffect(() => {
+        if (!window.electronAPI?.onCredentialsChanged) return;
+        const unsubscribe = window.electronAPI.onCredentialsChanged(() => {
+            if (isOpen) {
+                // Re-fetch credentials silently — purely additive, no state reset
+                window.electronAPI?.getStoredCredentials?.().then((creds: any) => {
+                    if (!creds) return;
+                    setSttProvider(creds.sttProvider || 'none');
+                    if (creds.groqSttModel) setGroqSttModel(creds.groqSttModel);
+                    setHasNativelyKey(creds.hasNativelyKey || false);
+                    setHasStoredSttGroqKey(creds.hasSttGroqKey);
+                    setHasStoredSttOpenaiKey(creds.hasSttOpenaiKey);
+                    setHasStoredDeepgramKey(creds.hasDeepgramKey);
+                    setHasStoredElevenLabsKey(creds.hasElevenLabsKey);
+                    setHasStoredAzureKey(creds.hasAzureKey);
+                    setHasStoredIbmWatsonKey(creds.hasIbmWatsonKey);
+                    setHasStoredSonioxKey(creds.hasSonioxKey || false);
+                }).catch(() => { /* silently ignore */ });
+            }
+        });
+        return () => unsubscribe();
+    }, []); // mount-once: isOpen is checked inside the callback
+
+    const handleSttProviderChange = async (provider: 'none' | 'google' | 'groq' | 'openai' | 'deepgram' | 'elevenlabs' | 'azure' | 'ibmwatson' | 'soniox' | 'natively') => {
         setSttProvider(provider);
         setIsSttDropdownOpen(false);
         setSttTestStatus('idle');
@@ -1019,7 +1086,7 @@ const SettingsOverlay: React.FC<SettingsOverlayProps> = ({ isOpen, onClose, init
     };
 
     const handleTestSttConnection = async () => {
-        if (sttProvider === 'google' || sttProvider === 'natively') return;
+        if (sttProvider === 'none' || sttProvider === 'google' || sttProvider === 'natively') return;
         const keyMap: Record<string, string> = {
             groq: sttGroqKey, openai: sttOpenaiKey, deepgram: sttDeepgramKey,
             elevenlabs: sttElevenLabsKey, azure: sttAzureKey, ibmwatson: sttIbmKey,
@@ -1420,7 +1487,7 @@ const SettingsOverlay: React.FC<SettingsOverlayProps> = ({ isOpen, onClose, init
                                                         </div>
                                                         <div>
                                                             <h3 className="text-sm font-bold text-text-primary">Verbose debug logging</h3>
-                                                            <p className="text-xs text-text-secondary mt-0.5">Print detailed audio, STT, and pipeline diagnostics to the terminal</p>
+                                                            <p className="text-xs text-text-secondary mt-0.5">Print detailed audio, STT, and pipeline diagnostics</p>
                                                         </div>
                                                     </div>
                                                     <div
@@ -1428,12 +1495,51 @@ const SettingsOverlay: React.FC<SettingsOverlayProps> = ({ isOpen, onClose, init
                                                             const newState = !verboseLogging;
                                                             setVerboseLogging(newState);
                                                             window.electronAPI?.setVerboseLogging?.(newState);
+                                                            if (newState) {
+                                                                setShowVerboseToast(true);
+                                                            }
                                                         }}
-                                                        className={`w-11 h-6 rounded-full relative transition-colors ${verboseLogging ? 'bg-amber-500' : 'bg-bg-toggle-switch border border-border-muted'}`}
+                                                        className={`w-11 h-6 rounded-full relative transition-colors cursor-pointer ${verboseLogging ? 'bg-amber-500' : 'bg-bg-toggle-switch border border-border-muted'}`}
                                                     >
                                                         <div className={`absolute top-1 left-1 w-4 h-4 rounded-full bg-white transition-transform ${verboseLogging ? 'translate-x-5' : 'translate-x-0'}`} />
                                                     </div>
                                                 </div>
+
+                                                {/* Verbose logging toast */}
+                                                <AnimatePresence>
+                                                    {showVerboseToast && (
+                                                        <motion.div
+                                                            key="verbose-toast"
+                                                            initial={{ opacity: 0, y: -6, height: 0 }}
+                                                            animate={{ opacity: 1, y: 0, height: 'auto' }}
+                                                            exit={{ opacity: 0, y: -4, height: 0 }}
+                                                            transition={{ duration: 0.2, ease: [0.2, 0, 0, 1] }}
+                                                            className="mx-4 mb-1 overflow-hidden"
+                                                        >
+                                                            <div className="flex items-center justify-between gap-3 px-3 py-2.5 rounded-xl bg-amber-500/10 border border-amber-500/20">
+                                                                <div className="flex items-center gap-2.5 min-w-0">
+                                                                    <Terminal size={14} className="text-amber-400 shrink-0" />
+                                                                    <p className="text-xs text-amber-200/80 leading-snug truncate">
+                                                                        Logs → <span className="font-mono text-amber-300">~/Documents/natively_debug.log</span>
+                                                                    </p>
+                                                                </div>
+                                                                <button
+                                                                    onClick={() => window.electronAPI?.openLogFile?.()}
+                                                                    className="shrink-0 text-[11px] font-medium text-amber-400 hover:text-amber-300 transition-colors px-2 py-0.5 rounded-md bg-amber-500/15 hover:bg-amber-500/25"
+                                                                >
+                                                                    Open
+                                                                </button>
+                                                            </div>
+                                                            {/* 5-second drain bar */}
+                                                            <motion.div
+                                                                className="h-[2px] bg-amber-500/40 rounded-b-xl"
+                                                                initial={{ scaleX: 1, originX: 0 }}
+                                                                animate={{ scaleX: 0 }}
+                                                                transition={{ duration: 5, ease: 'linear', delay: 0.2 }}
+                                                            />
+                                                        </motion.div>
+                                                    )}
+                                                </AnimatePresence>
 
                                                 {/* Interviewer Transcript */}
                                                 <div className="flex items-center justify-between px-4 py-3">
@@ -1743,16 +1849,28 @@ const SettingsOverlay: React.FC<SettingsOverlayProps> = ({ isOpen, onClose, init
                                             <div className="flex items-center gap-2">
                                                 <h3 className="text-sm font-bold text-text-primary">Professional Identity</h3>
                                                 <span className="bg-yellow-500/10 text-yellow-500 text-[9px] font-bold px-2 py-0.5 rounded-full uppercase tracking-wide">BETA</span>
+                                                {isPremium && premiumPlan && (
+                                                    <span className="bg-[#FACC15]/10 text-[#FACC15] border border-[#FACC15]/20 text-[9px] font-bold px-2 py-0.5 rounded-full uppercase tracking-wide ml-1">
+                                                        {premiumPlan.toUpperCase()} PLAN
+                                                    </span>
+                                                )}
+                                                {isTrialActive && !isPremium && (
+                                                    <span className="bg-violet-500/10 text-violet-400 border border-violet-500/20 text-[9px] font-bold px-2 py-0.5 rounded-full uppercase tracking-wide ml-1">
+                                                        FREE TRIAL
+                                                    </span>
+                                                )}
                                             </div>
                                             <button
                                                 onClick={() => setIsPremiumModalOpen(true)}
                                                 className={`text-[11px] font-semibold flex items-center gap-1.5 transition-all duration-200 px-2.5 py-1 rounded-full border shadow-[0_0_10px_rgba(250,204,21,0.2)] hover:shadow-[0_0_15px_rgba(250,204,21,0.3)] ${isPremium
                                                     ? (isLight ? 'bg-bg-component text-text-primary border-border-subtle hover:bg-bg-item-surface' : 'bg-zinc-800 text-white border-white/10 hover:bg-zinc-700')
+                                                    : isTrialActive
+                                                    ? 'bg-violet-500/15 text-violet-300 border-violet-500/30 hover:bg-violet-500/25 active:scale-[0.98]'
                                                     : 'bg-[#FACC15] text-black border-transparent hover:bg-[#FDE047] active:scale-[0.98]'
                                                     }`}
                                             >
-                                                {isPremium ? <CheckCircle size={12} className="text-green-400" /> : <Sparkles size={12} className="text-black/80" />}
-                                                {isPremium ? 'Manage Pro' : 'Unlock Pro'}
+                                                {isPremium ? <CheckCircle size={12} className="text-green-400" /> : isTrialActive ? <Sparkles size={12} className="text-violet-400" /> : <Sparkles size={12} className="text-black/80" />}
+                                                {isPremium ? 'Manage Pro' : isTrialActive ? 'Upgrade' : 'Unlock Pro'}
                                             </button>
                                         </div>
                                         <p className="text-xs text-text-secondary mb-2">
@@ -1801,11 +1919,11 @@ const SettingsOverlay: React.FC<SettingsOverlayProps> = ({ isOpen, onClose, init
                                                         )}
 
                                                         {/* High-fidelity Toggle */}
-                                                        <div className={`flex items-center gap-2 bg-bg-input px-3 py-1.5 rounded-full border border-border-subtle ${!isPremium ? 'opacity-40 cursor-not-allowed' : ''}`} title={!isPremium ? 'Requires Pro license' : ''}>
+                                                        <div className={`flex items-center gap-2 bg-bg-input px-3 py-1.5 rounded-full border border-border-subtle ${!hasProfileAccess ? 'opacity-40 cursor-not-allowed' : ''}`} title={!hasProfileAccess ? 'Requires Pro license' : ''}>
                                                             <span className="text-xs font-medium text-text-secondary">Persona Engine</span>
                                                             <div
                                                                 onClick={async () => {
-                                                                    if (!profileStatus.hasProfile || !isPremium) return;
+                                                                    if (!profileStatus.hasProfile || !hasProfileAccess) return;
                                                                     const newState = !profileStatus.profileMode;
                                                                     try {
                                                                         await window.electronAPI?.profileSetMode?.(newState);
@@ -1814,9 +1932,9 @@ const SettingsOverlay: React.FC<SettingsOverlayProps> = ({ isOpen, onClose, init
                                                                         console.error('Failed to toggle profile mode:', e);
                                                                     }
                                                                 }}
-                                                                className={`w-9 h-5 rounded-full relative transition-colors ${(!profileStatus.hasProfile || !isPremium) ? 'opacity-40 cursor-not-allowed bg-bg-toggle-switch' : profileStatus.profileMode ? 'bg-accent-primary' : 'bg-bg-toggle-switch border border-border-muted'}`}
+                                                                className={`w-9 h-5 rounded-full relative transition-colors ${(!profileStatus.hasProfile || !hasProfileAccess) ? 'opacity-40 cursor-not-allowed bg-bg-toggle-switch' : profileStatus.profileMode ? 'bg-accent-primary' : 'bg-bg-toggle-switch border border-border-muted'}`}
                                                             >
-                                                                <div className={`absolute top-1 left-1 w-3 h-3 rounded-full bg-white transition-transform ${profileStatus.profileMode && isPremium ? 'translate-x-4' : 'translate-x-0'}`} />
+                                                                <div className={`absolute top-1 left-1 w-3 h-3 rounded-full bg-white transition-transform ${profileStatus.profileMode && hasProfileAccess ? 'translate-x-4' : 'translate-x-0'}`} />
                                                             </div>
                                                         </div>
                                                     </div>
